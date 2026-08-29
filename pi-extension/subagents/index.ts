@@ -17,6 +17,7 @@ import {
 import { homedir } from "node:os";
 import {
   createSurface,
+  sendCommand,
   sendLongCommand,
   pollForExit,
   closeSurface,
@@ -705,7 +706,7 @@ function updateWidget() {
  * first positional message so that /skill: args land in messages[1..] and arrive
  * as standalone prompts in the child session.
  */
-const SUBAGENT_CONTROL_TOOLS = ["caller_ping", "subagent_done"] as const;
+const SUBAGENT_CONTROL_TOOLS = ["ask_question", "caller_ping", "subagent_done"] as const;
 
 /**
  * Build the child --tools allowlist.
@@ -795,6 +796,41 @@ function observeRunningSubagent(running: RunningSubagent, observedAt = Date.now(
       snapshot: read.reason,
       snapshotError: read.error,
     }, observedAt);
+  }
+}
+
+/** Persist name → sessionFile so subagent_message can resolve names after a subagent exits. */
+function nameRegistryPath(artifactDir: string): string {
+  return join(artifactDir, "subagent-names.json");
+}
+
+function recordSubagentName(artifactDir: string, name: string, sessionFile: string): void {
+  try {
+    const path = nameRegistryPath(artifactDir);
+    let registry: Record<string, string> = {};
+    if (existsSync(path)) {
+      try {
+        registry = JSON.parse(readFileSync(path, "utf-8")) as Record<string, string>;
+      } catch {
+        // Corrupt registry — start over rather than losing all names.
+      }
+    }
+    registry[name] = sessionFile;
+    mkdirSync(artifactDir, { recursive: true });
+    writeFileSync(path, JSON.stringify(registry, null, 2));
+  } catch {
+    // Best effort — name resolution for resume is a convenience, not a contract.
+  }
+}
+
+function resolveNameSessionFile(artifactDir: string, name: string): string | null {
+  try {
+    const path = nameRegistryPath(artifactDir);
+    if (!existsSync(path)) return null;
+    const registry = JSON.parse(readFileSync(path, "utf-8")) as Record<string, string>;
+    return registry[name] ?? null;
+  } catch {
+    return null;
   }
 }
 
@@ -1497,11 +1533,11 @@ function deliverPendingQuestion(pi: ExtensionAPI, running: RunningSubagent): voi
   if (!payload?.question) return;
 
   const elapsed = Math.floor((Date.now() - running.startTime) / 1000);
-  const replyHint = `\\n\\nReply with subagent_message({ name: "${running.name}", message: "…" }) — it stays open until you reply.`;
+  const replyHint = `\n\nReply with subagent_message({ name: "${running.name}", message: "…" }) — it stays open until you reply.`;
   pi.sendMessage(
     {
       customType: "subagent_question",
-      content: `Sub-agent "${running.name}" asks (${formatElapsed(elapsed)}):\\n\\n${payload.question}${replyHint}`,
+      content: `Sub-agent "${running.name}" asks (${formatElapsed(elapsed)}):\n\n${payload.question}${replyHint}`,
       display: true,
       details: {
         name: running.name,
@@ -1737,6 +1773,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         // Launch the subagent (creates pane, sends command)
         const running = await launchSubagent(params, ctx);
+        recordSubagentName(
+          getArtifactDir(ctx.sessionManager.getSessionDir(), ctx.sessionManager.getSessionId()),
+          running.name,
+          running.sessionFile,
+        );
 
         // Create a separate AbortController for the watcher
         // (the tool's signal completes when we return)
@@ -2250,6 +2291,112 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         };
       },
     });
+
+  // Message a subagent by name: steer it if running, hand off to resume if finished
+  pi.registerTool({
+    name: "subagent_message",
+    label: "Message Subagent",
+    description:
+      "Send a message to a subagent by name. Names are unique within your session and persist after a subagent finishes. " +
+      "If the subagent is still running, your message steers its live session and returns immediately. " +
+      "If it has finished, you get back its session path — resume it with subagent_resume({ sessionPath, message }). " +
+      "This is the reply channel for ask_question: when a running sub-agent asks a question, reply with subagent_message. " +
+      "DO NOT poll or fabricate results after sending.",
+    promptSnippet:
+      "Message a subagent by name: steers it if running; returns its session path for subagent_resume if finished. " +
+      "Reply channel for ask_question. Do not poll or fabricate results.",
+    parameters: Type.Object({
+      name: Type.String({
+        description: "Exact display name of the subagent (steer if running, resolve if finished).",
+      }),
+      message: Type.String({
+        description: "The message to deliver: a reply to its ask_question, or a follow-up instruction.",
+      }),
+    }),
+
+    renderCall(args, theme) {
+      const target = args.name ?? "(unknown)";
+      return new Text(
+        "○ " + theme.fg("toolTitle", theme.bold(target)) + theme.fg("dim", " — message"),
+        0,
+        0,
+      );
+    },
+
+    renderResult(result, _opts, theme) {
+      const details = result.details as any;
+      if (details?.status === "steered") {
+        return new Text(
+          theme.fg("success", "✓") +
+            " " +
+            theme.fg("toolTitle", theme.bold(details.name ?? "subagent")) +
+            theme.fg("dim", " — message delivered"),
+          0,
+          0,
+        );
+      }
+      const text = extractFirstText(result.content);
+      return new Text(theme.fg("dim", text), 0, 0);
+    },
+
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const requestedName = params.name?.trim();
+      if (!requestedName) {
+        const err = "Provide the subagent's `name`.";
+        return { content: [{ type: "text" as const, text: err }], details: { error: err } };
+      }
+      const message = params.message?.trim();
+      if (!message) {
+        const err = "`message` is required.";
+        return { content: [{ type: "text" as const, text: err }], details: { error: err } };
+      }
+
+      // A name matching a currently-running subagent always steers it.
+      const resolved = resolveInterruptTarget({ name: requestedName });
+      if ("running" in resolved) {
+        const running = resolved.running;
+        try {
+          // Flatten newlines so the message lands as one editable prompt line.
+          sendCommand(running.surface, message.replace(/\s*\n\s*/g, " ").trim());
+        } catch (error: any) {
+          const err =
+            `Failed to deliver message to "${running.name}" via mux: ${error?.message ?? String(error)}`;
+          return { content: [{ type: "text" as const, text: err }], details: { error: err } };
+        }
+        return {
+          content: [{
+            type: "text" as const,
+            text:
+              `Message delivered to running subagent "${running.name}". It picks this up at its next ` +
+              `turn boundary. If it exits, its result still arrives as a steer message.`,
+          }],
+          details: { id: running.id, name: running.name, status: "steered" },
+        };
+      }
+
+      // Not running — resolve the name to its session file via this session's registry.
+      const sessionId = ctx.sessionManager.getSessionId();
+      const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
+      const sessionPath = resolveNameSessionFile(artifactDir, requestedName);
+      if (!sessionPath || !existsSync(sessionPath)) {
+        const err =
+          `No running or finished subagent named "${requestedName}" in this session. ` +
+          `Check the exact name with subagents_list or your earlier subagent calls.`;
+        return { content: [{ type: "text" as const, text: err }], details: { error: err } };
+      }
+
+      // Hand off to resume — refname the tool call so the model does the right thing.
+      return {
+        content: [{
+          type: "text" as const,
+          text:
+            `Subagent "${requestedName}" has finished. Resume it with: ` +
+            `subagent_resume({ sessionPath: "${sessionPath}", name: "${requestedName}", message: <your message> }).`,
+        }],
+        details: { name: requestedName, sessionPath, status: "resume_hint" },
+      };
+    },
+  });
 
   // /iterate command — fork the session into a subagent
   pi.registerCommand("iterate", {

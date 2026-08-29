@@ -100,6 +100,8 @@ Subagent panes are created without stealing keyboard focus (cmux, tmux). Launch 
 | `subagent_interrupt` | Interrupt a running Pi-backed subagent's current turn                                       |
 | `subagents_list`     | List available agent definitions                                                            |
 | `subagent_resume`    | Resume a previous sub-agent session (async)                                                 |
+| `subagent_message`   | Message a subagent by name — steers it if running, returns its session path if finished     |
+| `safe_bash`          | Bash tool for subagents that blocks dangerous commands (opt-in via `tools: safe_bash`)      |
 
 | Command                    | Description                          |
 | -------------------------- | ------------------------------------ |
@@ -234,6 +236,19 @@ This is a turn-level interrupt, not a method for forcibly terminating a subagent
 ## caller_ping — Child-to-Parent Help Request
 
 The `caller_ping` tool lets a subagent request help from its parent agent. When called, the child session **exits** and the parent receives a notification with the help message. The parent can then **resume** the child session with a response using `subagent_resume`.
+
+### ask_question (subagent-only)
+
+The `ask_question` tool lets a **running** subagent ask its parent orchestrator a question **without ending its session**. It writes a `<session>.ask` signal file; the parent's watcher picks it up and receives a steered `subagent_question` message. The session stays open (auto-exit is suppressed while an answer is pending) and the parent replies with `subagent_message({ name, message })`, which steers the live session — the answer arrives as the subagent's next turn.
+
+Use this when a subagent hits ambiguous requirements or needs a decision only the orchestrator can make, instead of guessing. Ask one question per call; make separate calls for multiple questions.
+
+### subagent_message
+
+`subagent_message({ name, message })` addresses a subagent by its (unique) display name:
+
+- **Still running** — the message is typed into its pane and lands at its next turn boundary (returns immediately).
+- **Finished** — the tool returns the recorded session path; resume it with `subagent_resume({ sessionPath, name, message })`.
 
 **`caller_ping` parameters:**
 - `message` (required): What you need help with
