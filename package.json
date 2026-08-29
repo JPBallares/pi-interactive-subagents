@@ -26,8 +26,7 @@
   },
   "pi": {
     "extensions": [
-      "./index.ts",
-      "../pi-extensions-i18n/index.ts"
+      "./index.ts"
     ],
     "skills": [
       "./SKILL.md"
@@ -41,12 +40,10 @@
   "contributors": [
     "maplezzk"
   ],
-  "homepage": "https://github.com/maplezzk/pi-extensions/tree/main/packages/pi-interactive-subagents",
-  "bugs": "https://github.com/maplezzk/pi-extensions/issues",
+  "bugs": "https://github.com/HazAT/pi-interactive-subagents/issues",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/maplezzk/pi-extensions.git",
-    "directory": "packages/pi-interactive-subagents"
+    "url": "git+https://github.com/HazAT/pi-interactive-subagents.git"
   },
   "publishConfig": {
     "access": "public",

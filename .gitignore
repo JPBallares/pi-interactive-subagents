@@ -1,0 +1,4 @@
+node_modules/
+*.log
+worker.jsonl.exit
+.DS_Store

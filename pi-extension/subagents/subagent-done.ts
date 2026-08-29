@@ -2,6 +2,7 @@
  * Extension loaded into sub-agents.
  * - Shows agent identity + available tools as a styled widget above the editor (toggle with Ctrl+J)
  * - Provides a `subagent_done` tool for autonomous agents to self-terminate
+ * - Provides an `ask_question` tool for asking the parent orchestrator a question
  * - Nudges any agent that forgets to call subagent_done after generating
  *
  * auto-exit 历史背景：
@@ -98,6 +99,8 @@ export default function (pi: ExtensionAPI) {
 
   let doneCalled = false;
   let userInputAfterAgentEnd = false;
+  // Keep the session open while the parent answers ask_question.
+  let awaitingAnswer = false;
   let nudgeTimer: ReturnType<typeof setTimeout> | null = null;
 
   /** Cancel and forget the pending completion reminder, if any. */
@@ -193,6 +196,7 @@ export default function (pi: ExtensionAPI) {
     recorder.sessionStart();
     doneCalled = false;
     userInputAfterAgentEnd = false;
+    awaitingAnswer = false;
     clearNudgeTimer();
     const tools = pi.getAllTools();
     toolNames = tools.map((t) => t.name).sort();
@@ -203,6 +207,9 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("input", () => {
     recorder.input();
+    // A parent reply is delivered as input; clear the pending question before
+    // the next agent turn (including mid-run steers).
+    awaitingAnswer = false;
     // User typed something — they are in control, cancel any pending nudge.
     userInputAfterAgentEnd = true;
     clearNudgeTimer();
@@ -220,6 +227,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("agent_start", () => {
     agentStarted = true;
+    awaitingAnswer = false;
     recorder.agentStart();
     // Agent has started a new generation cycle — clear any pending nudge.
     userInputAfterAgentEnd = false;
@@ -235,6 +243,13 @@ export default function (pi: ExtensionAPI) {
     // 现在不论 autoExit env 如何，都不自动退出 — 只能靠 agent 自己调
     // subagent_done（或 caller_ping）。如果 agent 不调，下面会有 nudge 提醒。
     recorder.agentEndWaiting();
+
+    // A question parks the child until the parent replies. Do not nudge or
+    // close the session while that answer is pending.
+    if (awaitingAnswer) {
+      recorder.agentEndWaiting();
+      return;
+    }
 
     // Only a normal model stop means the agent itself chose to finish.
     // Provider errors and user aborts must stay quiet.
@@ -296,6 +311,52 @@ export default function (pi: ExtensionAPI) {
     handler: (ctx) => {
       expanded = !expanded;
       renderWidget(ctx);
+    },
+  });
+
+  pi.registerTool({
+    name: "ask_question",
+    label: "Ask Question",
+    description:
+      "Ask the parent orchestrator one question and pause until they reply. Use when requirements are ambiguous or you need a decision; do not guess.",
+    parameters: Type.Object({
+      question: Type.String({ description: "The single question to ask the parent orchestrator" }),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+      const sessionFile = process.env.PI_SUBAGENT_SESSION;
+      if (!sessionFile) {
+        throw new Error(
+          "ask_question is only available in subagent contexts. PI_SUBAGENT_SESSION environment variable is not set.",
+        );
+      }
+
+      awaitingAnswer = true;
+      clearNudgeTimer();
+      recorder.askQuestion();
+      writeFileSync(
+        `${sessionFile}.ask`,
+        JSON.stringify({
+          name: process.env.PI_SUBAGENT_NAME ?? "subagent",
+          agent: process.env.PI_SUBAGENT_AGENT ?? "",
+          question: params.question,
+        }),
+      );
+
+      return {
+        content: [{
+          type: "text",
+          text: "Question sent to the parent. Stop here and wait; the answer will arrive as your next message.",
+        }],
+        details: { question: params.question },
+      };
+    },
+    renderCall(args, theme) {
+      return new Text(
+        theme.fg("toolTitle", theme.bold("ask_question ")) +
+          theme.fg("muted", String((args as any).question ?? "")),
+        0,
+        0,
+      );
     },
   });
 

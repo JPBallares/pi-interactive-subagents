@@ -1479,7 +1479,43 @@ function copyClaudeSession(sentinelFile: string): string | null {
   }
 }
 
+/** Deliver a pending ask_question signal without ending the child session. */
+function deliverPendingQuestion(pi: ExtensionAPI, running: RunningSubagent): void {
+  const askFile = `${running.sessionFile}.ask`;
+  let payload: { question?: string } | null = null;
+  try {
+    if (!existsSync(askFile)) return;
+    payload = JSON.parse(readFileSync(askFile, "utf-8")) as { question?: string };
+  } catch {
+    // Ignore malformed or partially-written signals.
+  }
+  try {
+    unlinkSync(askFile);
+  } catch {
+    // Best effort; a later tick can retry delivery if the file remains.
+  }
+  if (!payload?.question) return;
+
+  const elapsed = Math.floor((Date.now() - running.startTime) / 1000);
+  const replyHint = `\\n\\nReply with subagent_message({ name: "${running.name}", message: "…" }) — it stays open until you reply.`;
+  pi.sendMessage(
+    {
+      customType: "subagent_question",
+      content: `Sub-agent "${running.name}" asks (${formatElapsed(elapsed)}):\\n\\n${payload.question}${replyHint}`,
+      display: true,
+      details: {
+        name: running.name,
+        agent: running.agent,
+        question: payload.question,
+        sessionFile: running.sessionFile,
+      },
+    },
+    { triggerTurn: true, deliverAs: "steer" },
+  );
+}
+
 async function watchSubagent(
+  pi: ExtensionAPI,
   running: RunningSubagent,
   signal: AbortSignal,
 ): Promise<SubagentResult> {
@@ -1499,6 +1535,7 @@ async function watchSubagent(
       sentinelFile: running.sentinelFile,
       onTick() {
         observeRunningSubagent(running);
+        deliverPendingQuestion(pi, running);
       },
     });
 
@@ -1711,7 +1748,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         startStatusRefresh(pi);
 
         // Fire-and-forget: start watching in background
-        watchSubagent(running, watcherAbort.signal)
+        watchSubagent(pi, running, watcherAbort.signal)
           .then((result) => {
             updateWidget(); // reflect removal from Map immediately
 
@@ -2140,7 +2177,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const watcherAbort = new AbortController();
         running.abortController = watcherAbort;
 
-        watchSubagent(running, watcherAbort.signal)
+        watchSubagent(pi, running, watcherAbort.signal)
           .then((result) => {
             updateWidget();
 
