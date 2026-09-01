@@ -73,6 +73,19 @@ export function parseDeniedTools(rawValue: string | undefined): string[] {
     .filter(Boolean);
 }
 
+/**
+ * Exponential backoff between consecutive completion nudges:
+ * baseDelayMs * 2^streak, capped at maxDelayMs. Pure so tests can verify
+ * the schedule without a live extension context.
+ */
+export function computeNudgeDelayMs(
+  baseDelayMs: number,
+  streak: number,
+  maxDelayMs: number,
+): number {
+  return Math.min(baseDelayMs * 2 ** streak, maxDelayMs);
+}
+
 export default function (pi: ExtensionAPI) {
   let toolNames: string[] = [];
   let denied: string[] = [];
@@ -89,19 +102,37 @@ export default function (pi: ExtensionAPI) {
   });
 
   // ── Agent completion nudge configuration ──
-  /** Delay (ms) before sending a nudge after agent_end. Configurable via env var. */
+  /** Delay (ms) before sending the FIRST nudge after agent_end. Configurable via env var. */
   const NUDGE_DELAY_MS = Math.max(
     1000,
     parseInt(process.env.PI_SUBAGENT_NUDGE_DELAY_MS ?? "5000", 10) || 5000,
   );
   /** Set to "1" to disable the nudge entirely. */
   const NUDGE_DISABLED = process.env.PI_SUBAGENT_NUDGE_DISABLE === "1";
+  /**
+   * Consecutive nudges before the reminder escalates and then stops.
+   *
+   * Without a cap the reminder becomes a self-sustaining feedback loop: the
+   * agent parks waiting for an ask_question answer, each turn end schedules a
+   * new nudge, the nudge spawns a new turn ("still blocked"), that turn end
+   * schedules another nudge — an infinite 5 s ping loop. Repetition pressure
+   * from those identical turns has also been observed to push small models
+   * into degenerate output loops (e.g. streaming ".5.5.5…" forever).
+   */
+  const NUDGE_MAX_STREAK = Math.max(
+    1,
+    parseInt(process.env.PI_SUBAGENT_NUDGE_MAX_STREAK ?? "5", 10) || 5,
+  );
+  /** Hard cap on the exponential backoff between consecutive nudges. */
+  const NUDGE_MAX_DELAY_MS = Math.max(NUDGE_DELAY_MS * 4, 60_000);
 
   let doneCalled = false;
   let userInputAfterAgentEnd = false;
   // Keep the session open while the parent answers ask_question.
   let awaitingAnswer = false;
   let nudgeTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Consecutive unanswered nudges; reset by real work (tool calls) or done. */
+  let nudgeStreak = 0;
 
   /** Cancel and forget the pending completion reminder, if any. */
   function clearNudgeTimer(): void {
@@ -117,23 +148,44 @@ export default function (pi: ExtensionAPI) {
    *
    * Each call replaces any pending nudge, so repeated agent_end events
    * automatically reset the timer. The nudge only fires if no new agent
-   * activity or user input arrives within NUDGE_DELAY_MS.
+   * activity or user input arrives within the current backoff delay.
+   *
+   * The delay doubles for every consecutive unanswered nudge (capped at
+   * NUDGE_MAX_DELAY_MS). Once nudgeStreak reaches NUDGE_MAX_STREAK, the
+   * reminder escalates once to an explicit "converge or hand back" message
+   * and then stops scheduling further nudges until real work happens.
    */
+  function computeNudgeDelay(): number {
+    return computeNudgeDelayMs(NUDGE_DELAY_MS, nudgeStreak, NUDGE_MAX_DELAY_MS);
+  }
+
   function scheduleAgentEndNudge(): void {
     clearNudgeTimer();
     // 不论 autoExit 是否启用，都必须 nudge — autoExit 已被移除，
     // agent 正常结束 turn 后只能靠主动调用 subagent_done 才能真正退出。
     if (NUDGE_DISABLED || doneCalled) return;
+    // Streak exhausted — stop pinging; the escalation already fired.
+    if (nudgeStreak > NUDGE_MAX_STREAK) return;
 
     nudgeTimer = setTimeout(() => {
       nudgeTimer = null;
       if (doneCalled || userInputAfterAgentEnd) return;
+      if (nudgeStreak > NUDGE_MAX_STREAK) return;
+
+      nudgeStreak += 1;
+      if (nudgeStreak > NUDGE_MAX_STREAK) {
+        pi.sendUserMessage(
+          i18n.t("agentEndNudgeEscalation", { count: String(NUDGE_MAX_STREAK) }),
+          { deliverAs: "followUp" },
+        );
+        return;
+      }
 
       pi.sendUserMessage(
         i18n.t("agentEndNudge"),
         { deliverAs: "followUp" },
       );
-    }, NUDGE_DELAY_MS);
+    }, computeNudgeDelay());
   }
 
   /** Render the subagent identity and tool availability widget. */
@@ -332,6 +384,8 @@ export default function (pi: ExtensionAPI) {
 
       awaitingAnswer = true;
       clearNudgeTimer();
+      // A fresh question is deliberate flow management, not idle spinning.
+      nudgeStreak = 0;
       recorder.askQuestion();
       writeFileSync(
         `${sessionFile}.ask`,
@@ -381,6 +435,7 @@ export default function (pi: ExtensionAPI) {
 
       doneCalled = true;
       clearNudgeTimer();
+      nudgeStreak = 0;
       recorder.callerPing();
       const exitData = {
         type: "ping" as const,
@@ -487,6 +542,7 @@ export default function (pi: ExtensionAPI) {
 
         doneCalled = true;
         clearNudgeTimer();
+        nudgeStreak = 0;
         recorder.subagentDone();
 
         if (sessionFile) {

@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Bug Fixes
+
+* Cap the agent-end completion reminder with exponential backoff and an escalation message. Previously, an agent parked waiting for an `ask_question` answer entered a self-sustaining reminder loop — each turn end scheduled a new nudge (default 5 s), the nudge spawned a new turn, and that turn scheduled another nudge forever. The repeated identical turns also cultivated degenerate model output (observed: gpt-5.6-luna streaming ".5.5.5…" until aborted). Now the delay doubles per consecutive unanswered nudge (capped), a final escalation message fires after `PI_SUBAGENT_NUDGE_MAX_STREAK` (default 5) consecutive nudges, and further nudges stop until real work (tool calls), `subagent_done`, `caller_ping`, or a fresh `ask_question` resets the streak.
+
 ## [3.11.0](https://github.com/maplezzk/pi-extensions/compare/pi-interactive-subagents-v3.10.1...pi-interactive-subagents-v3.11.0) (2026-08-20)
 
 

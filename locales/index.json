@@ -3,6 +3,10 @@
     "zh-CN": "【自动提醒】\n• 已完成 → 调用 subagent_done 结束。\n• 结束前自检：是否在原地打转？若是，立刻收敛结果，用 caller_ping 抛回主 agent，不要过度思考。\n• 还在处理 → 忽略。",
     "en-US": "[Auto reminder]\n• Done → call subagent_done to finish.\n• Before finishing, self-check: are you spinning in place? If so, converge your result immediately and hand it back to the main agent with caller_ping — don't overthink.\n• Still working → ignore."
   },
+  "agentEndNudgeEscalation": {
+    "zh-CN": "【最终提醒 · 已连续提醒 {count} 次】\n这是最后一次自动提醒，之后不会再提醒。\n• 任务已完成 → 立刻调用 subagent_done。\n• 在等待 ask_question 的答复 → 改用 caller_ping 把阻塞抛回主 agent，或重新 ask_question 一次。\n• 任务未完成且无需等待 → 立刻动手做实事（调用工具），不要再空转输出。",
+    "en-US": "[Final reminder · nudged {count} times in a row]\nThis is the last automatic reminder; no further reminders will be sent.\n• Task done → call subagent_done immediately.\n• Waiting on an ask_question answer → use caller_ping to hand the blocker back to the main agent, or ask_question again once.\n• Task incomplete with nothing to wait for → start doing real work (call tools) instead of idling."
+  },
   "muxCommandDescription": {
     "zh-CN": "配置 subagent 使用的终端复用器及 Herdr 布局模式",
     "en-US": "Configure the subagent multiplexer and Herdr layout mode"
